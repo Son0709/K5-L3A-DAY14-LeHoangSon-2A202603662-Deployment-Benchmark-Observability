@@ -282,6 +282,112 @@ call 3: HTTP 402 {'error': 'Daily budget exceeded', 'used_usd': 0.0009, 'budget_
 
 ---
 
+## Part 5: Scaling & Reliability
+
+### Exercise 5.1: Health checks (`05-scaling-reliability/develop/app.py`)
+
+Bản develop đã có sẵn hai endpoint (tôi đọc và chạy, không tự viết lại):
+
+- **`GET /health` (liveness, dòng 104–144):** trả 200 kèm `status`, `uptime_seconds`, `version` và kết quả kiểm tra bộ nhớ (psutil). Nếu endpoint này không trả 200 hoặc timeout thì nền tảng restart container.
+- **`GET /ready` (readiness, dòng 147–168):** trả 200 khi cờ `_is_ready` đã bật (sau khi startup xong), và **503** khi đang khởi động hoặc đang shutdown. Load balancer dùng nó để quyết định có route traffic vào instance hay không.
+
+```text
+GET /health -> HTTP/1.1 200 OK
+{"status":"ok","uptime_seconds":4.7,"version":"1.0.0","environment":"development","timestamp":"...","checks":{"memory":{"status":"ok","used_percent":12.8}}}
+
+GET /ready  -> HTTP/1.1 200 OK
+{"ready":true,"in_flight_requests":1}
+```
+
+**Liveness khác readiness ở đâu:** liveness hỏi "process còn sống không?", và nếu không thì **restart** nó. Readiness hỏi "đã sẵn sàng nhận traffic chưa?", và nếu chưa thì **ngừng gửi request** tới nó nhưng không restart. Một instance đang khởi động hoặc mất kết nối Redis nên là "sống nhưng chưa sẵn sàng". Nếu gộp hai thứ làm một, mất Redis sẽ khiến nền tảng restart cả đàn instance không cần thiết. Vì vậy ở Part 6, `/health` phải trả 200 kể cả khi Redis chết, còn `/ready` phải trả 503.
+
+### Exercise 5.2: Graceful shutdown
+
+Cơ chế trong file: middleware `track_requests` đếm request đang xử lý (`_in_flight_requests`), phần shutdown của `lifespan` đặt `_is_ready = False` rồi chờ tối đa 30 giây cho tới khi số request đang xử lý về 0, và `uvicorn.run(..., timeout_graceful_shutdown=30)`. Handler `handle_sigterm` chỉ ghi log, còn việc tắt gọn do uvicorn làm.
+
+**Thí nghiệm:** bắn 20 request song song vào `/ask`, rồi gửi `kill -TERM` ngay lập tức.
+
+```text
+Kết quả 20 request:   3 x HTTP 200     17 x 000 (không kết nối được)
+
+Log server:
+INFO:     Shutting down
+INFO:     ... "POST /ask?question=Long%20task%202 HTTP/1.1" 200 OK
+INFO:     ... "POST /ask?question=Long%20task%203 HTTP/1.1" 200 OK
+INFO:     Waiting for connections to close. (CTRL+C to force quit)
+INFO:     ... "POST /ask?question=Long%20task%201 HTTP/1.1" 200 OK
+INFO:     Waiting for application shutdown.
+... INFO 🔄 Graceful shutdown initiated...
+... INFO ✅ Shutdown complete
+INFO:     Finished server process
+Process còn sống sau đó? no
+```
+
+**Giải thích:** 3 request đã được server nhận trước SIGTERM đều hoàn thành với 200 và không có request nào bị cắt giữa chừng (log chỉ có 3 dòng `POST` và đều là 200). 17 request còn lại bắn quá sát lúc tắt nên chưa kịp kết nối, do server đã đóng cổng nghe và ngừng nhận kết nối mới. Đúng với hành vi mong muốn: **ngừng nhận mới, xử lý xong việc đang làm, rồi thoát.** Mock LLM chỉ trễ khoảng 0,1 giây nên rất khó bắt được request "đang dở", vì vậy con số 3/17 phụ thuộc vào thời điểm bắn và sẽ khác ở mỗi lần chạy.
+
+### Exercise 5.3: Stateless design (`05-scaling-reliability/production/app.py`)
+
+- **Anti-pattern:** giữ `conversation_history = {}` trong RAM của process. Khi chạy nhiều instance, mỗi instance có bộ nhớ riêng nên request 1 vào instance A còn request 2 vào instance B sẽ **không thấy** history. Restart cũng làm mất toàn bộ.
+- **Cách bản production làm:** state nằm trong Redis. `save_session` ghi `session:<id>` bằng `SETEX` với TTL 3600 giây, `load_session` đọc lại, và `append_to_history` giữ tối đa 20 tin nhắn. Mọi instance đều đọc ghi cùng một Redis nên instance nào cũng phục vụ được bất kỳ session nào. Mỗi response có `served_by` để thấy rõ instance nào xử lý.
+- **Lưu ý:** đầu file có fallback sang `_memory_store` (dict trong RAM) khi không kết nối được Redis, và response ghi rõ `"storage": "in-memory"`. Chế độ này là bẫy khi scale, vì lúc đó lại bị đúng lỗi phía trên. Ở Part 6, `/ready` phải trả 503 thay vì lặng lẽ chuyển sang bộ nhớ.
+
+**Vì sao state trong RAM hỏng khi chạy nhiều instance:** mỗi instance là một process riêng với bộ nhớ riêng và load balancer chia request tùy ý, nên không có gì đảm bảo hai request liên tiếp của cùng một user vào cùng một instance. Điều này cũng giải thích vì sao rate limiter và cost guard ở Part 4 (đều lưu trong RAM) sẽ sai khi scale: mỗi instance đếm riêng, nên giới hạn thực tế thành `giới hạn × số instance`.
+
+### Exercise 5.4: Load balancing
+
+Theo README mục K5 số 5 và số 7: stack này mở cổng **8080**, endpoint là **`POST /chat`**, và dùng `-p` để khỏi trùng tên project.
+
+```bash
+cd 05-scaling-reliability/production && touch .env.local
+docker compose -p k5-day14-scaling up -d --build --scale agent=3
+```
+
+```text
+NAME                       SERVICE   STATUS
+k5-day14-scaling-agent-1   agent     Up (healthy)   8000/tcp
+k5-day14-scaling-agent-2   agent     Up (healthy)   8000/tcp
+k5-day14-scaling-agent-3   agent     Up (healthy)   8000/tcp
+k5-day14-scaling-nginx-1   nginx     Up             0.0.0.0:8080->80/tcp
+k5-day14-scaling-redis-1   redis     Up (healthy)   6379/tcp
+```
+
+Gọi 10 request qua Nginx (`POST /chat`), đếm theo `served_by`:
+
+```text
+  3 instance-0057d6
+  4 instance-bb2946
+  3 instance-e54d1a
+```
+
+Nginx chia đều (round-robin) cho 3 instance qua DNS `agent` của Docker. `nginx.conf` còn có `proxy_next_upstream error timeout http_503`, tức là nếu một instance lỗi hoặc trả 503 thì Nginx thử lại ở instance khác (tối đa 3 lần).
+
+### Exercise 5.5: Test stateless
+
+`python test_stateless.py` gửi 5 câu trong cùng một session (script không tự tắt instance nào, xem README mục K5 số 7):
+
+```text
+Session ID: a9b6d910-0072-43de-b54a-3082d947b3c0
+Request 1: [instance-e54d1a]   Request 2: [instance-0057d6]   Request 3: [instance-bb2946]
+Request 4: [instance-e54d1a]   Request 5: [instance-0057d6]
+Instances used: {'instance-e54d1a', 'instance-0057d6', 'instance-bb2946'}
+Total messages: 10   (5 user + 5 assistant)
+✅ Session history preserved across all instances via Redis!
+```
+
+**Giải thích:** 5 câu đi qua cả 3 instance, nhưng history cuối cùng có đủ 10 tin nhắn theo đúng thứ tự, vì mọi instance đọc ghi chung Redis.
+
+**Thí nghiệm thêm (CODE_LAB mô tả bước "kill instance"):** tôi dừng `k5-day14-scaling-agent-1` bằng `docker stop`, rồi gọi tiếp với cùng `session_id`:
+
+```text
+history count sau khi stop 1 instance: 10      (không mất gì)
+4 request tiếp theo: vẫn trả 200, do 2 instance còn lại phục vụ (bb2946, e54d1a)
+history count cuối: 18                           (10 + 4 câu x 2 tin nhắn)
+```
+
+Hội thoại vẫn liền mạch và không mất dữ liệu khi một instance chết. Xong bài tôi đã chạy `docker compose -p k5-day14-scaling down` để trả cổng 8080.
+
+---
+
 ## AI log
 
 > Theo RULES.md mục 1: ghi mỗi lần dùng AI cho code Part 6 hoặc câu trả lời.
@@ -291,3 +397,4 @@ call 3: HTTP 402 {'error': 'Daily budget exceeded', 'used_usd': 0.0009, 'budget_
 | 1 | Part 1 | Đọc `develop/app.py`, `production/app.py`, `production/config.py` và chạy cả hai bản trong WSL để lấy bằng chứng cho mục Part 1 | Danh sách anti-pattern, output curl và bảng so sánh | Các số dòng và output curl đến từ lệnh chạy thật trên máy tôi (dòng 17, 18, 21, 33, 34, 51–53 của develop; `/health` 404; 422 và 200 như trên). **TODO của tôi:** đọc lại đối chiếu với file gốc trước khi nộp |
 | 2 | Part 2 | Đọc hai Dockerfile, `docker-compose.yml`, `nginx.conf`; build hai image, chạy container và stack Compose trong WSL để lấy số đo | Câu trả lời Exercise 2.1, giải thích multi-stage, sơ đồ stack | Kích thước (1.67 GB, 240 MB), `whoami`, trạng thái healthy, output curl qua Nginx đều lấy từ lệnh chạy thật. **TODO của tôi:** đọc lại các Dockerfile để tự giải thích được từng câu trả lời |
 | 3 | Part 4 | Đọc `develop/app.py`, `production/{app,auth,rate_limiter,cost_guard}.py`; chạy cả hai bản và vòng lặp curl trong WSL | Câu trả lời 4.1–4.4, output 401/403/200/429, thử 402 bằng `CostGuard` với ngân sách nhỏ | Output curl lấy từ lệnh chạy thật, token đã che. Tôi không tự viết lại cost guard, chỉ đọc và chạy thử mã có sẵn, và ghi rõ trong bài. **TODO của tôi:** đọc lại `rate_limiter.py` và `cost_guard.py` để tự giải thích được |
+| 4 | Part 5 | Đọc `develop/app.py`, `production/{app.py,docker-compose.yml,nginx.conf,test_stateless.py}`; chạy health check, thí nghiệm SIGTERM, stack 3 instance và test stateless trong WSL | Câu trả lời 5.1–5.5 và các output | Output lấy từ lệnh chạy thật. Thí nghiệm SIGTERM phụ thuộc thời điểm bắn nên số 3/17 sẽ khác mỗi lần, và tôi đã ghi rõ trong bài. **TODO của tôi:** đọc lại `lifespan` và middleware đếm request để tự giải thích được |
