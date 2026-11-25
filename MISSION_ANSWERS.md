@@ -184,6 +184,104 @@ HTTP/1.1 200 OK
 
 ---
 
+## Part 4: API Security
+
+### Exercise 4.1: API Key authentication (`04-api-gateway/develop/app.py`)
+
+Chạy bằng `AGENT_API_KEY=secret-key-123 python app.py` (README mục K5 số 6).
+
+- **API key được check ở đâu?** Hàm `verify_api_key` (dòng 39–54) đọc header `X-API-Key` qua `APIKeyHeader`, so với biến `API_KEY` lấy từ env `AGENT_API_KEY` (dòng 35). Endpoint `/ask` gắn nó bằng `Depends(verify_api_key)` (dòng 70). `/` và `/health` để public.
+- **Sai key thì sao?** Thiếu key trả **401**, sai key trả **403** (xem output dưới). Lưu ý bản Part 6 yêu cầu cả hai trường hợp đều là 401.
+- **Rotate key thế nào?** Đổi giá trị biến `AGENT_API_KEY` rồi restart service. Không cần sửa code hay build lại image. Vì key chỉ đọc từ env nên đổi trên dashboard của nền tảng là đủ.
+
+```text
+# Không có key
+curl -i -X POST http://localhost:8000/ask -H "Content-Type: application/json" -d '{"question": "Hello"}'
+HTTP/1.1 401 Unauthorized
+{"detail":"Missing API key. Include header: X-API-Key: <your-key>"}
+
+# Sai key
+curl -i -X POST http://localhost:8000/ask -H "X-API-Key: wrong" ...
+HTTP/1.1 403 Forbidden
+{"detail":"Invalid API key."}
+
+# Đúng key
+curl -i -X POST http://localhost:8000/ask -H "X-API-Key: secret-key-123" ...
+HTTP/1.1 200 OK
+{"question":"Hello","answer":"Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận."}
+```
+
+### Exercise 4.2: JWT authentication (`04-api-gateway/production/`)
+
+Theo README mục K5 số 6: lấy token ở `POST /auth/token` với `student` / `demo123` (không phải `/token` và `admin`/`secret` như CODE_LAB). Tôi cũng thử đường dẫn cũ: `POST /token` trả **404**.
+
+**JWT flow (`auth.py`):** `POST /auth/token` kiểm tra username/password (`authenticate_user`), rồi `create_token` ký payload `{sub, role, iat, exp}` bằng HS256 với `JWT_SECRET` (hết hạn sau 60 phút). Mỗi request sau đó gửi `Authorization: Bearer <token>`, và `verify_token` giải mã, kiểm tra chữ ký và hạn rồi lấy ra `username`, `role`. Server không cần tra database mỗi request nên là stateless.
+
+```text
+# Sai mật khẩu
+POST /auth/token {"username":"student","password":"x"}
+HTTP/1.1 401 Unauthorized   {"detail":"Invalid credentials"}
+
+# Không có token
+POST /ask
+HTTP/1.1 401 Unauthorized   {"detail":"Authentication required. Include: Authorization: Bearer <token>"}
+
+# Token giả
+POST /ask  -H "Authorization: Bearer abc.def.ghi"
+HTTP/1.1 403 Forbidden      {"detail":"Invalid token."}
+
+# Token thật (đã che token)
+POST /ask  -H "Authorization: Bearer eyJhbGciOiJI...<masked>"
+HTTP/1.1 200 OK
+{"question":"Explain JWT","answer":"Tôi là AI agent ...","usage":{"requests_remaining":9,"budget_remaining_usd":1.9e-05}}
+```
+
+### Exercise 4.3: Rate limiting (`rate_limiter.py`)
+
+- **Algorithm:** Sliding Window Counter (dòng 7–10). Mỗi user có một `deque` chứa timestamp, các mốc cũ hơn 60 giây bị loại, và nếu số mốc còn lại ≥ giới hạn thì trả 429.
+- **Limit:** user **10 request/phút**, admin **100 request/phút** (dòng 86–87).
+- **Bypass cho admin:** `app.py` dòng 141 chọn `rate_limiter_admin` khi `role == "admin"`. Đây là giới hạn cao hơn (100/phút), không phải không giới hạn.
+- **Điểm yếu:** state nằm trong RAM của từng process, nên chạy nhiều instance hay restart thì bộ đếm bị mất hoặc chia nhỏ. Part 6 yêu cầu chuyển sang Redis.
+
+Vòng lặp curl 14 lần với token `student` (đã dùng 1 request ở bước 4.2 trước đó, nên request thứ 10 trong vòng lặp là request thứ 11 trong cửa sổ 60 giây):
+
+```text
+req 1..9 : HTTP/1.1 200 OK
+req 10   : HTTP/1.1 429 Too Many Requests
+req 11..14: HTTP/1.1 429 Too Many Requests
+
+Header của lần 429:
+x-ratelimit-limit: 10
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 1795597131
+retry-after: 59
+{"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":59}}
+```
+
+### Exercise 4.4: Cost guard (`cost_guard.py`)
+
+**Cách làm của file có sẵn:** (tôi đọc và chạy thử, không tự viết lại)
+- Mỗi lần `/ask`, `check_budget(user)` chạy **trước** khi gọi LLM, và `record_usage(user, in_tokens, out_tokens)` chạy **sau** khi gọi xong.
+- Chi phí tính theo token: `input/1000 × 0.00015 + output/1000 × 0.0006` (giá GPT-4o-mini).
+- Có hai tầng: ngân sách mỗi user **$1/ngày** (vượt thì **402**) và ngân sách toàn cục **$10/ngày** (vượt thì **503**). Khi dùng ≥ 80% thì ghi cảnh báo vào log.
+- Bộ đếm theo ngày (`time.strftime("%Y-%m-%d")`): sang ngày mới thì `_get_record` tạo record mới nên tự reset.
+
+Với `student`, một request chỉ tốn khoảng $0.00002, nên không thể chạm $1 bằng tay. Để tự thấy 402, tôi tạo `CostGuard(daily_budget_usd=0.0005)` và gọi liên tiếp:
+
+```text
+call 1: ok, spent=$0.00045
+call 2: ok, spent=$0.0009
+call 3: HTTP 402 {'error': 'Daily budget exceeded', 'used_usd': 0.0009, 'budget_usd': 0.0005, 'resets_at': 'midnight UTC'}
+```
+
+**Hạn chế và hướng làm ở Part 6:** `CostGuard` lưu trong RAM (`_records` là dict), nên mất khi restart và không dùng chung giữa các instance. Ở Part 6 tôi sẽ lưu chi phí trong Redis (khóa theo ngày hoặc tháng, `INCRBYFLOAT`, đặt TTL để tự reset) và trả 402 khi vượt `DAILY_BUDGET_USD`.
+
+**Quan sát thêm:** trường `budget_remaining_usd` trong response của `/ask` thực ra trả về `usage.total_cost_usd` (số đã tiêu, `1.9e-05`), không phải số còn lại. Đây là lỗi đặt tên trong code mẫu, và tôi không sửa vì bài này chỉ yêu cầu đọc và chạy.
+
+**Cần hiểu (CP3):** rate limit bảo vệ **tốc độ** (một client không gọi dồn dập làm quá tải hay brute-force), còn cost guard bảo vệ **tiền** (kể cả khi từng client gọi chậm, tổng chi phí LLM vẫn có trần). Chỉ có rate limit thì nhiều user hoặc request đắt vẫn làm cháy ngân sách. Chỉ có cost guard thì một client có thể làm nghẽn dịch vụ trước khi chạm trần tiền.
+
+---
+
 ## AI log
 
 > Theo RULES.md mục 1: ghi mỗi lần dùng AI cho code Part 6 hoặc câu trả lời.
@@ -192,3 +290,4 @@ HTTP/1.1 200 OK
 |---|---|---|---|---|
 | 1 | Part 1 | Đọc `develop/app.py`, `production/app.py`, `production/config.py` và chạy cả hai bản trong WSL để lấy bằng chứng cho mục Part 1 | Danh sách anti-pattern, output curl và bảng so sánh | Các số dòng và output curl đến từ lệnh chạy thật trên máy tôi (dòng 17, 18, 21, 33, 34, 51–53 của develop; `/health` 404; 422 và 200 như trên). **TODO của tôi:** đọc lại đối chiếu với file gốc trước khi nộp |
 | 2 | Part 2 | Đọc hai Dockerfile, `docker-compose.yml`, `nginx.conf`; build hai image, chạy container và stack Compose trong WSL để lấy số đo | Câu trả lời Exercise 2.1, giải thích multi-stage, sơ đồ stack | Kích thước (1.67 GB, 240 MB), `whoami`, trạng thái healthy, output curl qua Nginx đều lấy từ lệnh chạy thật. **TODO của tôi:** đọc lại các Dockerfile để tự giải thích được từng câu trả lời |
+| 3 | Part 4 | Đọc `develop/app.py`, `production/{app,auth,rate_limiter,cost_guard}.py`; chạy cả hai bản và vòng lặp curl trong WSL | Câu trả lời 4.1–4.4, output 401/403/200/429, thử 402 bằng `CostGuard` với ngân sách nhỏ | Output curl lấy từ lệnh chạy thật, token đã che. Tôi không tự viết lại cost guard, chỉ đọc và chạy thử mã có sẵn, và ghi rõ trong bài. **TODO của tôi:** đọc lại `rate_limiter.py` và `cost_guard.py` để tự giải thích được |
