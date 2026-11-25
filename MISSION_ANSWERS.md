@@ -388,6 +388,74 @@ Hội thoại vẫn liền mạch và không mất dữ liệu khi một instanc
 
 ---
 
+## Part 6: Final Project (`06-lab-complete/`)
+
+### Kết quả `python check_production_ready.py` (chạy đầy đủ, có Docker, trong WSL2)
+
+Python 3.11.18, `os.name = posix`. Phần "📋 Checklist Deliverable" của output:
+
+```text
+================================================================
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 43/43 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+================================================================
+```
+
+Một số số đo từ cùng lần chạy: image **238 MB** (giới hạn 500 MB), build 33 giây, `docker stop` tắt trong **0,9 giây** với exit code 0, rate limit chặn sau đúng 5 request khi `RATE_LIMIT_PER_MINUTE=5`, 17 dòng log đều là JSON hợp lệ.
+
+### Thiết kế và lý do (các điểm Lab Coach có thể hỏi)
+
+| Tiêu chí | Cách làm | Vì sao |
+|---|---|---|
+| `/health` vs `/ready` | `/health` luôn 200. `/ready` ping Redis và trả **503** khi lỗi | Liveness chỉ hỏi process còn sống không. Nếu `/health` phụ thuộc Redis thì Redis chết sẽ khiến nền tảng restart cả agent, mà restart không sửa được Redis. `/ready` mới là chỗ báo "chưa nhận được traffic" để load balancer tạm bỏ instance |
+| Redis client | `redis.from_url()` ở mức module, không ping lúc import, timeout 2 giây | App phải khởi động được khi Redis chưa sẵn sàng (container khởi động cùng lúc với Redis) |
+| API key | `APIKeyHeader(auto_error=False)`, so sánh bằng `hmac.compare_digest`, thiếu hoặc sai đều **401** | Mặc định FastAPI trả 403 khi thiếu header. `compare_digest` tránh timing attack. Chưa đặt `AGENT_API_KEY` thì từ chối tất cả thay vì "mở cửa" |
+| Rate limit | Sliding window bằng Redis sorted set (`ZREMRANGEBYSCORE` → `ZADD` → `ZCARD`) trong một transaction `MULTI/EXEC`. Vượt thì gỡ request vừa thêm và trả **429** kèm `Retry-After` | Một transaction tránh race giữa 2 worker uvicorn. State trong Redis nên vẫn còn sau restart và dùng chung giữa các instance (khác `rate_limiter.py` của Part 4 chỉ nằm trong RAM). Key trong Redis là bản băm SHA-256 của API key, không lưu key thô |
+| Cost guard | Cộng dồn chi phí vào Redis bằng `INCRBYFLOAT` theo ngày (`cost:daily:YYYY-MM-DD`) và theo tháng (`cost:monthly:YYYY-MM`), có TTL. `check_budget()` trước LLM, `record_cost()` sau LLM, vượt ngưỡng nào trước thì trả **402** | Đổi ngày hoặc tháng thì sang key mới nên tự reset. Là giới hạn mềm: chi phí chỉ được cộng sau khi gọi LLM nên vài request chạy song song có thể cùng qua cổng kiểm tra |
+| Cấu hình | `config.py` đọc env bằng `os.getenv`, `.env.example` liệt kê đủ biến, `.env` nằm trong `.gitignore` | 12-Factor: đổi cấu hình giữa môi trường mà không sửa code. Không có secret trong code |
+| Log JSON | `JsonFormatter` tự viết (`json.dumps`), mỗi dòng một object (`ts`, `lvl`, `event`, các trường thêm). Stack trace nếu có chỉ vào log, đã escape thành một dòng | Dễ parse trong log aggregator. Không log API key |
+| Lỗi | Handler cho `Exception` trả `500 {"detail":"Internal server error"}`, đầu vào sai trả 422 | Không lộ stack trace cho client |
+| Graceful shutdown | **Không** tự đăng ký handler SIGTERM, để uvicorn xử lý (ngừng nhận kết nối mới, chờ request đang chạy xong, thoát với exit code 0). Dockerfile dùng `exec uvicorn` để uvicorn là PID 1 | Skeleton cảnh báo handler tự viết sẽ chặn mất handler của uvicorn khiến process không bao giờ thoát. Nếu CMD là dạng shell không có `exec` thì PID 1 là `sh`, không chuyển tiếp SIGTERM, và `docker stop` sẽ chờ hết 10 giây rồi SIGKILL (exit code 137) |
+| Dockerfile | Multi-stage (builder cài dependencies vào `--prefix=/install`, runtime chỉ copy kết quả), `python:3.11-slim`, user non-root `appuser`, `HEALTHCHECK`, CMD theo `${PORT:-8000}` | Image nhỏ và không chứa công cụ build. `PORT` do Railway/Render cấp |
+| Compose | `env_file` với `required: false`, `REDIS_URL=redis://redis:6379/0` đè lên `.env`, `depends_on` với `service_healthy` | Chạy được cả khi không có `.env`. Agent chỉ start sau khi Redis healthy |
+
+### Tự kiểm tra thêm (ngoài script chấm)
+
+Script chấm dùng chung một Redis tạm cho cả phiên, nên ở bước cost guard nó báo "402 ở request thứ 1": Redis đã có sẵn chi phí tích lũy từ các bước trước. Để chắc chắn cost guard đúng chứ không đạt nhờ trạng thái cũ, tôi chạy riêng trên Redis sạch với ngân sách $0.00005:
+
+```text
+req 1 -> 200   req 2 -> 200   req 3 -> 200
+req 4 -> 402 {"detail":"Daily budget exceeded: $0.000060 of $5e-05 used."}
+```
+
+Request 3 vẫn qua dù đã sát ngưỡng, vì chi phí chỉ được cộng sau khi gọi LLM (giới hạn mềm, đúng như mô tả ở trên). Các kiểm tra khác trên agent chạy thật:
+
+- Rate limit 3/phút: request 1–3 trả 200, request 4 và 5 trả 429 kèm `retry-after: 60`.
+- Đầu vào sai: thiếu `question`, `question` rỗng, JSON hỏng đều trả **422**. Không có key trả **401**. Không lộ stack trace.
+- Tắt Redis giữa chừng: `/health` vẫn **200**, `/ready` và `/ask` trả **503**.
+- `docker compose up --build` với `.env` (key thử): `/health` 200, `/ready` 200, `/ask` không key 401, có key 200, container chạy bằng `appuser`, healthcheck `healthy`, `docker stop` 0,9 giây exit code 0.
+
+### Gặp phải khi làm
+
+- `requirements.txt` ghim `pydantic==2.9.0` không cài được trên Python 3.14 mặc định của WSL (không có wheel, phải build bằng Rust), mà script chấm chạy bằng interpreter cục bộ. Tôi tạo venv Python 3.11 bằng `uv` (`~/venv-lab06`) và giữ nguyên `requirements.txt`. Docker image vốn dùng Python 3.11 nên không bị ảnh hưởng.
+- Tôi chạy `git status` trong WSL thì thấy gần như mọi file bị đánh dấu đã sửa. Đó chỉ là chênh lệch ký tự xuống dòng CRLF giữa Git của WSL và của Windows (`core.autocrlf=true`). Git của Windows chỉ liệt kê đúng các file tôi đã sửa. Vì vậy tôi commit bằng Git của Windows, không commit từ WSL.
+
+---
+
 ## AI log
 
 > Theo RULES.md mục 1: ghi mỗi lần dùng AI cho code Part 6 hoặc câu trả lời.
@@ -398,3 +466,4 @@ Hội thoại vẫn liền mạch và không mất dữ liệu khi một instanc
 | 2 | Part 2 | Đọc hai Dockerfile, `docker-compose.yml`, `nginx.conf`; build hai image, chạy container và stack Compose trong WSL để lấy số đo | Câu trả lời Exercise 2.1, giải thích multi-stage, sơ đồ stack | Kích thước (1.67 GB, 240 MB), `whoami`, trạng thái healthy, output curl qua Nginx đều lấy từ lệnh chạy thật. **TODO của tôi:** đọc lại các Dockerfile để tự giải thích được từng câu trả lời |
 | 3 | Part 4 | Đọc `develop/app.py`, `production/{app,auth,rate_limiter,cost_guard}.py`; chạy cả hai bản và vòng lặp curl trong WSL | Câu trả lời 4.1–4.4, output 401/403/200/429, thử 402 bằng `CostGuard` với ngân sách nhỏ | Output curl lấy từ lệnh chạy thật, token đã che. Tôi không tự viết lại cost guard, chỉ đọc và chạy thử mã có sẵn, và ghi rõ trong bài. **TODO của tôi:** đọc lại `rate_limiter.py` và `cost_guard.py` để tự giải thích được |
 | 4 | Part 5 | Đọc `develop/app.py`, `production/{app.py,docker-compose.yml,nginx.conf,test_stateless.py}`; chạy health check, thí nghiệm SIGTERM, stack 3 instance và test stateless trong WSL | Câu trả lời 5.1–5.5 và các output | Output lấy từ lệnh chạy thật. Thí nghiệm SIGTERM phụ thuộc thời điểm bắn nên số 3/17 sẽ khác mỗi lần, và tôi đã ghi rõ trong bài. **TODO của tôi:** đọc lại `lifespan` và middleware đếm request để tự giải thích được |
+| 5 | Part 6 | Đọc `check_production_ready.py` và các file khung; viết `config.py`, `redis_client.py`, `auth.py`, `rate_limiter.py`, `cost_guard.py`, `main.py`, `Dockerfile`, `.dockerignore`, `docker-compose.yml`, `.env.example`, `railway.toml`, `render.yaml` | Mã nguồn của toàn bộ Part 6; script chấm báo `PASS 12/12` ngay lần chạy đầu | Tôi chạy script chấm đầy đủ trong WSL (Docker thật, `os.name = posix`), rồi tự kiểm chứng thêm cost guard trên Redis sạch, rate limit theo từng key, lỗi đầu vào, Redis chết giữa chừng và `docker compose up` thật. Phát hiện script báo "402 ở request thứ 1" do Redis dùng chung giữa các bước nên tôi kiểm lại riêng (3 request 200 rồi 402). **TODO của tôi:** đọc lại từng file trong `06-lab-complete/app/` để tự giải thích được, nhất là `rate_limiter.py` (transaction Redis) và vì sao không tự đăng ký handler SIGTERM |
