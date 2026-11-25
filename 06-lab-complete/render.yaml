@@ -1,12 +1,14 @@
 # Render Blueprint — New → Blueprint → chọn repo, Render đọc file này.
-# Lưu ý: render.yaml nằm trong thư mục con 06-lab-complete/, nên khi tạo Blueprint
-# hãy chỉ đúng đường dẫn file hoặc đặt Root Directory = 06-lab-complete.
+# Lưu ý: file này nằm trong thư mục con 06-lab-complete/ (Render mặc định tìm ở gốc repo),
+# nên khi tạo Blueprint phải chỉ đúng đường dẫn: 06-lab-complete/render.yaml.
+# dockerfilePath và dockerContext tính từ GỐC REPO. Gốc repo có một Dockerfile khác
+# (ví dụ Go), nên phải ghi rõ đường dẫn tới Dockerfile của agent để không build nhầm.
 services:
   - type: web
     name: day14-agent
     runtime: docker
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
+    dockerfilePath: ./06-lab-complete/Dockerfile
+    dockerContext: ./06-lab-complete
     plan: free
     region: singapore
     healthCheckPath: /health

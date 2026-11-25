@@ -184,6 +184,41 @@ HTTP/1.1 200 OK
 
 ---
 
+## Part 3: Cloud Deployment
+
+> Theo CHECKPOINTS (CP6) và README mục K5 số 8, tôi deploy chính agent Part 6 (`06-lab-complete/`), không deploy app mẫu trong `03-cloud-deployment/`.
+
+### Exercise 3.1 / 3.2: Deploy
+
+- **Nền tảng chính:** `<<CHƯA ĐIỀN: Railway hoặc Render>>`
+- **URL public:** `<<CHƯA ĐIỀN sau khi deploy>>`
+- **Ảnh:** `screenshots/dashboard.png`, `screenshots/running.png`, `screenshots/test.png` (xem `DEPLOYMENT.md`)
+
+### So sánh `railway.toml` với `render.yaml`
+
+Hai file cùng lo phần "nền tảng build và chạy container thế nào", nhưng khác nhau về phạm vi:
+
+| Điểm | `railway.toml` | `render.yaml` |
+|---|---|---|
+| Phạm vi | Chỉ mô tả **một service**: cách build (`builder = "DOCKERFILE"`) và cách deploy (`healthcheckPath = "/health"`, chính sách restart) | Mô tả **cả hệ thống** (Blueprint / Infrastructure as Code): web service **và** Redis (`type: keyvalue`) khai báo cùng một file |
+| Biến môi trường | Không nằm trong file. Đặt bằng `railway variables set` hoặc dashboard | Khai báo ngay trong file: giá trị cố định (`ENVIRONMENT`), secret sinh tự động (`AGENT_API_KEY` dùng `generateValue: true`), và **nối thẳng sang service khác** (`REDIS_URL` lấy từ `fromService` → Redis `connectionString`) |
+| Redis | Phải tự thêm service Redis trong dashboard, rồi gán `REDIS_URL` bằng tay | Được tạo cùng lúc và tự nối vào web service, nên không cần thao tác tay |
+| Cách deploy | `railway up` đẩy thư mục **cục bộ** lên (CLI push) | Render đọc repo **GitHub** (`autoDeploy: true`), tức push là deploy |
+| Đường dẫn Dockerfile | Chạy `railway up` ngay trong `06-lab-complete/` nên Dockerfile ở thư mục hiện tại | File nằm trong thư mục con, mà đường dẫn tính từ gốc repo. Gốc repo có một `Dockerfile` khác, nên phải ghi rõ `./06-lab-complete/Dockerfile` kẻo build nhầm |
+| Plan, region | Đặt trong dashboard | Ghi trong file (`plan: free`, `region: singapore`) |
+
+**Vì sao khác nhau:** Railway coi `railway.toml` là cấu hình bổ sung cho một service tạo qua CLI hoặc dashboard (trải nghiệm theo kiểu thao tác trực tiếp). Render thiết kế `render.yaml` để mô tả toàn bộ hạ tầng theo cách khai báo, lấy từ Git. Hệ quả thực tế: ở Render, bài này gần như deploy một lần được cả agent và Redis, còn ở Railway tôi phải tự tạo Redis và đặt `REDIS_URL`.
+
+**Điểm chung:** cả hai đều dùng cùng `Dockerfile`, cùng `healthcheckPath = /health`, và cùng việc app lắng nghe theo biến `PORT` do nền tảng cấp (CMD dùng `${PORT:-8000}`). Dockerfile không phải sửa gì để chạy được trên hai nơi.
+
+### Exercise 3.3: Cloud Run pipeline (chỉ đọc, không deploy)
+
+`cloudbuild.yaml` định nghĩa pipeline CI/CD 4 bước chạy tuần tự (mỗi bước `waitFor` bước trước), kích hoạt khi push lên `main`: **(1) test**: cài dependencies và chạy `pytest tests/`, nếu lỗi thì dừng cả pipeline; **(2) build**: build Docker image, gắn tag theo `$COMMIT_SHA` và `latest`, dùng `--cache-from` để tái sử dụng layer; **(3) push**: đẩy mọi tag lên Container Registry; **(4) deploy**: `gcloud run deploy` image theo commit SHA lên Cloud Run vùng `asia-southeast1`, đặt `min-instances=1` (tránh cold start), `max-instances=10`, và lấy `OPENAI_API_KEY` từ Secret Manager thay vì ghi trong code. `service.yaml` là bản mô tả cùng service theo dạng khai báo (Knative): giới hạn tài nguyên (1 CPU, 512Mi), `containerConcurrency: 80`, secret `OPENAI_API_KEY` và `AGENT_API_KEY` từ Secret Manager, `livenessProbe` gọi `/health` và `startupProbe` gọi `/ready`, đúng mô hình liveness và readiness đã học ở Part 5.
+
+Hai điểm tôi thấy lệch khi đọc: pipeline chạy `pytest tests/` mà lab không có thư mục `tests/`, nên chạy thật sẽ đỏ ở bước 1; và bước deploy chỉ gắn secret `OPENAI_API_KEY`, còn `service.yaml` gắn thêm `AGENT_API_KEY`, nên hai file chưa đồng bộ.
+
+---
+
 ## Part 4: API Security
 
 ### Exercise 4.1: API Key authentication (`04-api-gateway/develop/app.py`)
