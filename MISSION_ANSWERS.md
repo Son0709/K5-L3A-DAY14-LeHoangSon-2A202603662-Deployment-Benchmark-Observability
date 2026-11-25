@@ -190,9 +190,20 @@ HTTP/1.1 200 OK
 
 ### Exercise 3.1 / 3.2: Deploy
 
-- **Nền tảng chính:** `<<CHƯA ĐIỀN: Railway hoặc Render>>`
-- **URL public:** `<<CHƯA ĐIỀN sau khi deploy>>`
-- **Ảnh:** `screenshots/dashboard.png`, `screenshots/running.png`, `screenshots/test.png` (xem `DEPLOYMENT.md`)
+- **Nền tảng chính:** Render (Exercise 3.2), deploy bằng Blueprint từ `06-lab-complete/render.yaml` (Web Service + Key Value Redis).
+- **URL public:** https://day14-agent-ufm6.onrender.com
+- **Ảnh:** [dashboard](screenshots/dashboard.png), [running](screenshots/running.png), [test](screenshots/test.png) (chi tiết trong `DEPLOYMENT.md`)
+
+4 lệnh tự kiểm của CP6 trên URL public (chỉ in mã HTTP, không lộ key):
+
+```text
+GET  /health                      -> 200
+GET  /ready                       -> 200   (Redis trên Render đã kết nối)
+POST /ask (không có key)          -> 401
+POST /ask (X-API-Key đúng)        -> 200
+```
+
+Lần đầu thử có key tôi nhận 401 vì giá trị key trong terminal không khớp key đang chạy trên Render. Nhập lại đúng giá trị hiện tại trên dashboard thì trả 200, nên lỗi nằm ở cách nhập key chứ không ở code.
 
 ### So sánh `railway.toml` với `render.yaml`
 
@@ -502,3 +513,4 @@ Request 3 vẫn qua dù đã sát ngưỡng, vì chi phí chỉ được cộng 
 | 3 | Part 4 | Đọc `develop/app.py`, `production/{app,auth,rate_limiter,cost_guard}.py`; chạy cả hai bản và vòng lặp curl trong WSL | Câu trả lời 4.1–4.4, output 401/403/200/429, thử 402 bằng `CostGuard` với ngân sách nhỏ | Output curl lấy từ lệnh chạy thật, token đã che. Tôi không tự viết lại cost guard, chỉ đọc và chạy thử mã có sẵn, và ghi rõ trong bài. **TODO của tôi:** đọc lại `rate_limiter.py` và `cost_guard.py` để tự giải thích được |
 | 4 | Part 5 | Đọc `develop/app.py`, `production/{app.py,docker-compose.yml,nginx.conf,test_stateless.py}`; chạy health check, thí nghiệm SIGTERM, stack 3 instance và test stateless trong WSL | Câu trả lời 5.1–5.5 và các output | Output lấy từ lệnh chạy thật. Thí nghiệm SIGTERM phụ thuộc thời điểm bắn nên số 3/17 sẽ khác mỗi lần, và tôi đã ghi rõ trong bài. **TODO của tôi:** đọc lại `lifespan` và middleware đếm request để tự giải thích được |
 | 5 | Part 6 | Đọc `check_production_ready.py` và các file khung; viết `config.py`, `redis_client.py`, `auth.py`, `rate_limiter.py`, `cost_guard.py`, `main.py`, `Dockerfile`, `.dockerignore`, `docker-compose.yml`, `.env.example`, `railway.toml`, `render.yaml` | Mã nguồn của toàn bộ Part 6; script chấm báo `PASS 12/12` ngay lần chạy đầu | Tôi chạy script chấm đầy đủ trong WSL (Docker thật, `os.name = posix`), rồi tự kiểm chứng thêm cost guard trên Redis sạch, rate limit theo từng key, lỗi đầu vào, Redis chết giữa chừng và `docker compose up` thật. Phát hiện script báo "402 ở request thứ 1" do Redis dùng chung giữa các bước nên tôi kiểm lại riêng (3 request 200 rồi 402). **TODO của tôi:** đọc lại từng file trong `06-lab-complete/app/` để tự giải thích được, nhất là `rate_limiter.py` (transaction Redis) và vì sao không tự đăng ký handler SIGTERM |
+| 6 | Part 3 | Đọc `cloudbuild.yaml`, `service.yaml`; sửa `render.yaml` (đường dẫn Dockerfile), viết phần so sánh `railway.toml`/`render.yaml`, pipeline Cloud Run và `DEPLOYMENT.md`; hướng dẫn các bước deploy Render | Văn bản so sánh, mô tả pipeline, `DEPLOYMENT.md`; chẩn đoán lỗi 401 khi thử với key | Tôi tự deploy trên Render và chạy 4 lệnh kiểm tra bằng tài khoản và key của mình. AI chỉ chạy `check_production_ready.py --public-url` để xác nhận `/health` trả 200. **TODO của tôi:** chụp 3 ảnh trong `screenshots/` và đọc lại để tự giải thích sự khác nhau giữa hai file cấu hình |
