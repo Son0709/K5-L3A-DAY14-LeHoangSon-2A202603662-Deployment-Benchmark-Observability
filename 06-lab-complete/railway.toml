@@ -1,8 +1,14 @@
-# ============================================================
-# TODO (tiêu chí 12): cấu hình deploy Railway
-#   [build]  builder = "DOCKERFILE"
-#   [deploy] healthcheckPath = "/health"
-#   App phải lắng nghe theo biến PORT do Railway cấp (xử lý trong CMD của Dockerfile).
-#
-# Chỉ cần một trong hai file railway.toml / render.yaml, nhưng file nào có nội dung thì phải đúng.
-# ============================================================
+# Railway — deploy từ thư mục 06-lab-complete:  railway up
+# Cần thêm một service Redis trong cùng project, rồi đặt biến cho service agent:
+#   AGENT_API_KEY, REDIS_URL (trỏ tới Redis), ENVIRONMENT=production
+# Railway tự cấp biến PORT; CMD trong Dockerfile đã lắng nghe theo $PORT.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
